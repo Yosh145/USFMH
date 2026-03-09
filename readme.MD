@@ -1,3 +1,7 @@
+![Python](https://img.shields.io/badge/Python-3.8+-blue?logo=python)
+![C](https://img.shields.io/badge/C-ESP-IDF-green?logo=c)
+![ESP32](https://img.shields.io/badge/ESP32-S3-orange?logo=espressif)
+
 # USFMH — User Calibrated Frequency Mapping Headset
 
 **Senior Project — Spring 2026, University of New Hampshire**
@@ -91,4 +95,3 @@ The script will:
 | ESP32 → Host | *raw int16 PCM bytes* | Processed audio payload |
 | ESP32 → Host | `DONE\n` | Processing complete |
 
-## Current Version: v0.1 — Heathrow
