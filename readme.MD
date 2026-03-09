@@ -1,7 +1,3 @@
-![Python](https://img.shields.io/badge/Python-3.8+-blue?logo=python)
-![C](https://img.shields.io/badge/C-ESP-IDF-green?logo=c)
-![ESP32](https://img.shields.io/badge/ESP32-S3-orange?logo=espressif)
-
 # USFMH — User Calibrated Frequency Mapping Headset
 
 **Senior Project — Spring 2026, University of New Hampshire**
@@ -83,6 +79,21 @@ The script will:
 1. Handshake with the ESP32 (`READY`)
 2. Play tones and prompt you to respond `y`/`n`
 3. Receive and play back the EQ-processed audio
+
+# List of Softwares/Hardwares Used
+![Espressif](https://img.shields.io/badge/espressif-E7352C.svg?style=for-the-badge&logo=espressif&logoColor=white)
+![C](https://img.shields.io/badge/c-%2300599C.svg?style=for-the-badge&logo=c&logoColor=white)
+![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
+
+![Visual Studio Code](https://img.shields.io/badge/Visual%20Studio%20Code-0078d7.svg?style=for-the-badge&logo=visual-studio-code&logoColor=white)
+![Drawio](https://img.shields.io/badge/drawio-%23F08705?style=for-the-badge&logo=diagrams.net&logoColor=white)
+![KiCad](https://img.shields.io/badge/kicad-%23314CB0.svg?style=for-the-badge&logo=kicad&logoColor=white)
+![Google Drive](https://img.shields.io/badge/Google%20Drive-4285F4?style=for-the-badge&logo=googledrive&logoColor=white)
+
+AI Help from:
+![Claude](https://img.shields.io/badge/Claude-D97757?style=for-the-badge&logo=claude&logoColor=white)
+![ChatGPT](https://img.shields.io/badge/chatGPT-74aa9c?style=for-the-badge&logo=openai&logoColor=white)
+![Google Gemini](https://img.shields.io/badge/google%20gemini-8E75B2?style=for-the-badge&logo=google%20gemini&logoColor=white)
 
 ## Serial Protocol
 
