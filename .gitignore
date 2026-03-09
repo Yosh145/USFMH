@@ -1,0 +1,34 @@
+# Build output
+build/
+USFMH/build/
+
+# ESP-IDF managed components (fetched by idf.py)
+managed_components/
+USFMH/managed_components/
+
+# sdkconfig is auto-generated from sdkconfig.defaults
+sdkconfig
+USFMH/sdkconfig
+
+# SPIFFS binary image
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
