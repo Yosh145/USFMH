@@ -21,9 +21,6 @@ const float band_edges[NUM_BAND_EDGES] = {
     3078, 4075, 5396, 7145, 9458, 12519, 16572, 19440
 };
 
-// Boost applied to frequencies the user cannot hear (dB)
-#define BOOST_DB 6.0f
-
 // Duration of each test tone in ms
 #define TONE_DURATION_MS 2000
 
@@ -126,11 +123,11 @@ void hearing_test_run(hearing_result_t *result)
         mid_idx = 17;  // 1142 Hz
         ESP_LOGI(TAG, "Retrying at %.0f Hz", test_frequencies[mid_idx]);
         if (!test_frequency(test_frequencies[mid_idx])) {
-            // User can't hear common frequencies — mark all as not heard
-            ESP_LOGW(TAG, "Cannot hear mid-range frequencies — boosting all bands");
+            // User can't hear common frequencies — no filters active
+            ESP_LOGW(TAG, "Cannot hear mid-range frequencies — no bands will be activated");
             for (int i = 0; i < NUM_TEST_FREQS; i++) {
                 result->heard[i] = false;
-                result->gain_db[i] = BOOST_DB;
+                result->gain_db[i] = 0.0f;
             }
             result->num_tested = 2;
             return;
@@ -152,14 +149,14 @@ void hearing_test_run(hearing_result_t *result)
     ESP_LOGI(TAG, "Hearing range: %.0f Hz (idx %d) to %.0f Hz (idx %d)",
              test_frequencies[lower], lower, test_frequencies[upper], upper);
 
-    // Fill in results: heard within [lower, upper], not heard outside
+    // Fill in results: heard within [lower, upper] → filter activated; outside → inactive
     for (int i = 0; i < NUM_TEST_FREQS; i++) {
         if (i >= lower && i <= upper) {
             result->heard[i] = true;
-            result->gain_db[i] = 0.0f;
+            result->gain_db[i] = HEARING_TEST_BOOST_DB;
         } else {
             result->heard[i] = false;
-            result->gain_db[i] = BOOST_DB;
+            result->gain_db[i] = 0.0f;
         }
     }
 
@@ -170,9 +167,9 @@ void hearing_test_run(hearing_result_t *result)
     result->num_tested = 2 + (int)(2 * 3.8);  // approximate
 
     ESP_LOGI(TAG, "=== Hearing Test Complete ===");
-    ESP_LOGI(TAG, "Bands with boost:");
+    ESP_LOGI(TAG, "Activated bands (heard frequencies):");
     for (int i = 0; i < NUM_TEST_FREQS; i++) {
-        if (result->gain_db[i] > 0.0f) {
+        if (result->heard[i]) {
             ESP_LOGI(TAG, "  %.0f Hz: +%.1f dB", test_frequencies[i], result->gain_db[i]);
         }
     }

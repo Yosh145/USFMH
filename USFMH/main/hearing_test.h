@@ -5,6 +5,7 @@
 
 #define NUM_TEST_FREQS   27
 #define NUM_BAND_EDGES   28
+#define HEARING_TEST_BOOST_DB 6.0f
 
 // Test frequencies (Hz) — logarithmically spaced from 10 Hz to 14263 Hz
 extern const float test_frequencies[NUM_TEST_FREQS];

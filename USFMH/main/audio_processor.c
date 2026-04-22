@@ -1,130 +1,199 @@
 #include "audio_processor.h"
 #include <math.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "dsps_biquad.h"
 
 static const char *TAG = "audio_proc";
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+#define PROCESS_YIELD_INTERVAL  4096
 
-// Per-band filter state
+// Per-band filter state (header only — history lives in PSRAM)
 typedef struct {
-    float coeffs[5];    // [b0, b1, b2, a1, a2] (normalized, a0=1)
-    float delay[2];     // delay line [w0, w1]
-    bool  active;       // false if gain_db == 0 (skip this filter)
+    float  *history;          // PSRAM: [num_taps]
+    size_t  history_index;
+    float   center_freq_hz;
+    bool    active;
 } band_filter_t;
 
-static band_filter_t filters[NUM_TEST_FREQS];
+static band_filter_t *filters = NULL;      // PSRAM array [num_bands]
+static int *active_filter_indices = NULL;   // PSRAM array [num_bands]
+static int active_filter_count = 0;
 
-/**
- * Compute peaking EQ biquad coefficients using the RBJ Audio Cookbook formula.
- *
- * H(s) = (s^2 + s*(A/Q) + 1) / (s^2 + s/(A*Q) + 1)
- *
- * @param coeffs      Output: [b0, b1, b2, a1, a2] (a0 normalized to 1)
- * @param center_freq Center frequency in Hz
- * @param sample_rate Sample rate in Hz
- * @param gain_db     Gain at center frequency in dB (positive = boost)
- * @param Q           Quality factor (bandwidth control)
- */
-static void compute_peaking_eq(float *coeffs, float center_freq, float sample_rate,
-                                float gain_db, float Q)
+static const filter_bank_t *s_bank = NULL;
+static uint32_t s_num_bands = 0;
+static uint32_t s_num_taps = 0;
+
+static bool band_is_heard(const hearing_result_t *result, float freq_hz)
 {
-    float A     = powf(10.0f, gain_db / 40.0f);
-    float w0    = 2.0f * (float)M_PI * center_freq / sample_rate;
-    float cos_w = cosf(w0);
-    float sin_w = sinf(w0);
-    float alpha = sin_w / (2.0f * Q);
+    int best_index = 0;
+    float best_delta = fabsf(freq_hz - test_frequencies[0]);
 
-    float b0 =  1.0f + alpha * A;
-    float b1 = -2.0f * cos_w;
-    float b2 =  1.0f - alpha * A;
-    float a0 =  1.0f + alpha / A;
-    float a1 = -2.0f * cos_w;
-    float a2 =  1.0f - alpha / A;
+    for (int i = 1; i < NUM_TEST_FREQS; i++) {
+        float delta = fabsf(freq_hz - test_frequencies[i]);
+        if (delta < best_delta) {
+            best_delta = delta;
+            best_index = i;
+        }
+    }
 
-    // Normalize by a0
-    coeffs[0] = b0 / a0;
-    coeffs[1] = b1 / a0;
-    coeffs[2] = b2 / a0;
-    coeffs[3] = a1 / a0;
-    coeffs[4] = a2 / a0;
+    return result->heard[best_index];
 }
 
-esp_err_t audio_processor_init(const hearing_result_t *result, uint32_t sample_rate)
+esp_err_t audio_processor_init(const filter_bank_t *bank,
+                               const hearing_result_t *result,
+                               uint32_t sample_rate)
 {
-    ESP_LOGI(TAG, "Initializing %d-band EQ at %lu Hz", NUM_TEST_FREQS,
+    s_bank = bank;
+    s_num_bands = bank->num_bands;
+    s_num_taps = bank->num_taps;
+
+    ESP_LOGI(TAG, "Initializing %lu-band FIR filter bank (%lu taps) at %lu Hz",
+             (unsigned long)s_num_bands, (unsigned long)s_num_taps,
              (unsigned long)sample_rate);
 
     float nyquist = (float)sample_rate / 2.0f;
-    int active_count = 0;
 
-    for (int i = 0; i < NUM_TEST_FREQS; i++) {
-        memset(&filters[i], 0, sizeof(band_filter_t));
-
-        float gain = result->gain_db[i];
-
-        // Skip bands with no gain change
-        if (fabsf(gain) < 0.1f) {
-            filters[i].active = false;
-            continue;
-        }
-
-        float center = test_frequencies[i];
-
-        // Skip if center frequency is above Nyquist
-        if (center >= nyquist * 0.95f) {
-            ESP_LOGW(TAG, "Band %d (%.0f Hz) above Nyquist, skipping", i, center);
-            filters[i].active = false;
-            continue;
-        }
-
-        // Compute Q from band edges: Q = f_center / bandwidth
-        float f_low  = band_edges[i];
-        float f_high = band_edges[i + 1];
-        float bandwidth = f_high - f_low;
-        float Q = center / bandwidth;
-
-        // Clamp Q to a reasonable range
-        if (Q < 0.5f) Q = 0.5f;
-        if (Q > 10.0f) Q = 10.0f;
-
-        compute_peaking_eq(filters[i].coeffs, center, (float)sample_rate, gain, Q);
-        filters[i].active = true;
-        active_count++;
-
-        ESP_LOGI(TAG, "Band %2d: %.0f Hz, Q=%.2f, gain=%.1f dB",
-                 i, center, Q, gain);
+    if (sample_rate != 48000U) {
+        ESP_LOGW(TAG, "Filter bank was generated for 48000 Hz input, got %lu Hz",
+                 (unsigned long)sample_rate);
     }
 
-    ESP_LOGI(TAG, "%d active EQ bands out of %d", active_count, NUM_TEST_FREQS);
+    // Allocate filter state array in PSRAM
+    filters = heap_caps_calloc(s_num_bands, sizeof(band_filter_t), MALLOC_CAP_SPIRAM);
+    active_filter_indices = heap_caps_malloc(s_num_bands * sizeof(int), MALLOC_CAP_SPIRAM);
+    if (!filters || !active_filter_indices) {
+        ESP_LOGE(TAG, "Failed to allocate filter state arrays");
+        return ESP_ERR_NO_MEM;
+    }
+
+    int active_count = 0;
+
+    for (uint32_t i = 0; i < s_num_bands; i++) {
+        float low_cut = bank->min_freqs[i];
+        float high_cut = bank->max_freqs[i];
+        float center = bank->center_freqs[i];
+
+        if (low_cut >= high_cut || center >= nyquist) {
+            filters[i].active = false;
+            continue;
+        }
+
+        // Allocate history buffer in PSRAM
+        filters[i].history = heap_caps_calloc(s_num_taps, sizeof(float), MALLOC_CAP_SPIRAM);
+        if (!filters[i].history) {
+            ESP_LOGE(TAG, "Failed to allocate history buffer for band %lu", (unsigned long)i);
+            audio_processor_free();
+            return ESP_ERR_NO_MEM;
+        }
+
+        filters[i].history_index = 0;
+        filters[i].center_freq_hz = center;
+        filters[i].active = band_is_heard(result, center);
+
+        if (filters[i].active) {
+            active_filter_indices[active_count] = (int)i;
+            active_count++;
+        }
+
+        ESP_LOGI(TAG, "Band %2lu: %.1f-%.1f Hz, center %.0f Hz, %s",
+                 (unsigned long)i, low_cut, high_cut, center,
+                 filters[i].active ? "ACTIVE" : "off");
+    }
+
+    active_filter_count = active_count;
+
+    if (active_count == 0) {
+        ESP_LOGW(TAG, "No active bands — output will pass through unchanged");
+    }
+
+    size_t hist_total = (size_t)active_count * s_num_taps * sizeof(float);
+    ESP_LOGI(TAG, "%d active FIR bands, %lu taps each (%.1f KB history in PSRAM)",
+             active_count, (unsigned long)s_num_taps, (double)hist_total / 1024.0);
+
     return ESP_OK;
 }
 
 esp_err_t audio_processor_apply(float *samples, uint32_t num_samples)
 {
-    // Apply each active biquad filter in cascade
-    for (int i = 0; i < NUM_TEST_FREQS; i++) {
-        if (!filters[i].active) continue;
-
-        esp_err_t err = dsps_biquad_f32(samples, samples, (int)num_samples,
-                                         filters[i].coeffs, filters[i].delay);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Biquad filter %d failed: %d", i, err);
-            return err;
-        }
+    if (active_filter_count == 0) {
+        return ESP_OK;
     }
+
+    int num_taps = (int)s_num_taps;
+
+    // Accumulation buffer in PSRAM
+    float *output = heap_caps_calloc(num_samples, sizeof(float), MALLOC_CAP_SPIRAM);
+    if (!output) {
+        ESP_LOGE(TAG, "Failed to allocate output buffer (%lu floats)", (unsigned long)num_samples);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Band-first loop: keeps one band's coefficients and history hot in cache
+    for (int active_idx = 0; active_idx < active_filter_count; active_idx++) {
+        int fi = active_filter_indices[active_idx];
+        band_filter_t *filt = &filters[fi];
+        const float *coeffs = s_bank->coeffs + (size_t)fi * s_num_taps;
+        float *hist = filt->history;
+        int head = (int)filt->history_index;
+
+        for (uint32_t s = 0; s < num_samples; s++) {
+            hist[head] = samples[s];
+
+            // FIR convolution: two-pass over circular buffer (no branch in MAC loop)
+            float acc = 0.0f;
+
+            for (int tap = 0; tap <= head; tap++) {
+                acc += coeffs[tap] * hist[head - tap];
+            }
+            for (int tap = head + 1; tap < num_taps; tap++) {
+                acc += coeffs[tap] * hist[num_taps - tap + head];
+            }
+
+            output[s] += acc;
+
+            if (++head >= num_taps) head = 0;
+
+            if ((s & (PROCESS_YIELD_INTERVAL - 1)) == 0) {
+                taskYIELD();
+            }
+        }
+
+        filt->history_index = (size_t)head;
+    }
+
+    memcpy(samples, output, num_samples * sizeof(float));
+    heap_caps_free(output);
 
     return ESP_OK;
 }
 
 void audio_processor_reset(void)
 {
-    for (int i = 0; i < NUM_TEST_FREQS; i++) {
-        filters[i].delay[0] = 0.0f;
-        filters[i].delay[1] = 0.0f;
+    if (!filters) return;
+    for (uint32_t i = 0; i < s_num_bands; i++) {
+        if (filters[i].history) {
+            memset(filters[i].history, 0, s_num_taps * sizeof(float));
+            filters[i].history_index = 0;
+        }
     }
+}
+
+void audio_processor_free(void)
+{
+    if (filters) {
+        for (uint32_t i = 0; i < s_num_bands; i++) {
+            heap_caps_free(filters[i].history);
+        }
+        heap_caps_free(filters);
+        filters = NULL;
+    }
+    heap_caps_free(active_filter_indices);
+    active_filter_indices = NULL;
+    active_filter_count = 0;
+    s_bank = NULL;
+    s_num_bands = 0;
+    s_num_taps = 0;
 }

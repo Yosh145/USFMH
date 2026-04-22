@@ -4,10 +4,10 @@
 
 ## Overview
 
-USFMH is an embedded audio processing system that personalizes headphone audio based on an individual's hearing profile. It runs on an **ESP32-S3** and works in three phases:
+The User Calibrated Frequency Mapping Headset is an embedded audio processing system that personalizes headphone audio based on an individual's hearing profile. It runs on an **ESP32-S3** and works in three phases:
 
 1. **Hearing Test** — A binary-search-based tone test across 27 logarithmically spaced frequency bands (10 Hz – 14,263 Hz) determines which frequencies the user can and cannot hear.
-2. **EQ Processing** — A 27-band parametric equalizer (peaking biquad filters) boosts frequencies the user has difficulty hearing, applied in real time to a WAV file stored on SPIFFS.
+2. **EQ Processing** — A MATLAB-style 32-band FIR filter bank boosts frequencies the user has difficulty hearing, applied to a WAV file stored on SPIFFS.
 3. **Playback** — Processed audio is streamed back to a host computer over serial for playback.
 
 A companion **Python host script** runs on a laptop to play test tones through speakers, collect user responses, and play back the processed result.
@@ -24,15 +24,16 @@ A companion **Python host script** runs on a laptop to play test tones through s
 ├── partitions.csv            # Custom partition table (NVS, app, SPIFFS)
 ├── sdkconfig.defaults        # SDK configuration defaults
 ├── run.sh                    # One-click build, flash & run script (fish)
-├── data.md                   # Test frequency and band-edge reference data
+├── data.md                   # Hearing-test frequency and band-edge reference data
 ├── USFMH/main/
 │   ├── main.c                # Application entry point (app_main)
 │   ├── hearing_test.c/h      # Serial-based hearing test (binary search)
-│   ├── audio_processor.c/h   # 27-band biquad EQ engine
+│   ├── audio_processor.c/h   # 32-band FIR filter-bank engine
 │   └── wav_utils.c/h         # WAV file read/write helpers
-├── host/
-│   ├── demo.py               # Python host companion script
-│   └── requirements.txt      # Python dependencies
+├── pythondemo/
+│   ├── demo.py               # Python host script and offline FIR/WAV prep helpers
+│   ├── requirements.txt      # Python dependencies
+│   └── gens/                 # Filter/test-file generation scripts
 └── spiffs_data/
     └── input.wav             # Audio file to process (flashed to SPIFFS)
 ```
@@ -44,6 +45,18 @@ A companion **Python host script** runs on a laptop to play test tones through s
 - A WAV file placed in `spiffs_data/input.wav` (16-bit mono)
 
 ## Quick Start
+
+Until the SD card arrives, the project uses the existing SPIFFS partition for audio input and output. The host script can now both prepare a WAV for SPIFFS and export the FIR coefficient matrix used by the firmware.
+
+### 0. Prepare the input WAV and optional filter matrix
+
+```bash
+cd pythondemo
+python demo.py --prepare-wav /path/to/source.wav
+python demo.py --export-filter-matrix filter_matrix.txt
+```
+
+The first command writes a 16-bit mono 48 kHz file to `../spiffs_data/input.wav` by default. The second writes the full 32-band coefficient list plus a matrix-form block that is easy to paste into MATLAB, Python, or C arrays. After updating `filter_matrix.txt`, regenerate `USFMH/main/filter_bank_coeffs.h` with `python pythondemo/gens/generate_filter_header.py` before rebuilding the firmware.
 
 ### 1. Build, flash & monitor
 
@@ -70,7 +83,7 @@ idf.py -p /dev/ttyACM0 flash monitor
 In a separate terminal:
 
 ```bash
-cd host
+cd pythondemo
 pip install -r requirements.txt
 python demo.py --port /dev/ttyACM0 --baud 921600
 ```
@@ -78,7 +91,7 @@ python demo.py --port /dev/ttyACM0 --baud 921600
 The script will:
 1. Handshake with the ESP32 (`READY`)
 2. Play tones and prompt you to respond `y`/`n`
-3. Receive and play back the EQ-processed audio
+3. Receive and play back the FIR-processed audio
 
 # List of Softwares/Hardwares Used
 ![Espressif](https://img.shields.io/badge/espressif-E7352C.svg?style=for-the-badge&logo=espressif&logoColor=white)

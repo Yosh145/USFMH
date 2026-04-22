@@ -1,0 +1,5 @@
+pyserial>=3.5
+numpy>=1.21
+sounddevice>=0.4
+matplotlib>=3.5
+scipy>=1.7

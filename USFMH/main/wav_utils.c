@@ -2,9 +2,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 
 static const char *TAG = "wav_utils";
+#define WAV_IO_YIELD_INTERVAL 8
 
 // Standard WAV file header structures
 typedef struct __attribute__((packed)) {
@@ -147,6 +150,10 @@ esp_err_t wav_read_f32(const char *filepath, float **out_buf, uint32_t *out_num_
         }
         offset += read;
         remaining -= read;
+
+        if (((offset / CHUNK) % WAV_IO_YIELD_INTERVAL) == 0) {
+            vTaskDelay(1);
+        }
     }
 
     fclose(f);
@@ -221,6 +228,10 @@ esp_err_t wav_write_f32(const char *filepath, const float *buf, uint32_t num_sam
         fwrite(tmp, sizeof(int16_t), to_write, f);
         offset += to_write;
         remaining -= to_write;
+
+        if (((offset / CHUNK) % WAV_IO_YIELD_INTERVAL) == 0) {
+            vTaskDelay(1);
+        }
     }
 
     fclose(f);
