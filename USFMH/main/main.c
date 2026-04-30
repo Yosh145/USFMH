@@ -20,7 +20,6 @@ static const char *TAG = "main";
 #define COEFF_PATH       SD_MOUNT_POINT "/filters.bin"
 #define WAV_INPUT_PATH   SD_MOUNT_POINT "/input.wav"
 #define WAV_OUTPUT_PATH  SD_MOUNT_POINT "/output.wav"
-#define PROCESS_CHUNK    1024
 #define YIELD_EVERY_SAMPLES 8192
 
 /**
@@ -188,42 +187,22 @@ void app_main(void)
         return;
     }
 
-    // 7. Process audio in chunks
+    // 7. Process entire audio buffer in one FFT-filterbank pass.
+    //    The processor handles its own block loop, progress logging, and
+    //    group-delay compensation internally.
     ESP_LOGI(TAG, "Processing %lu samples...", (unsigned long)num_samples);
     audio_processor_reset();
 
-    uint32_t offset = 0;
-    uint32_t next_progress_report = 10;
     int64_t process_start_us = esp_timer_get_time();
-    while (offset < num_samples) {
-        uint32_t chunk = num_samples - offset;
-        if (chunk > PROCESS_CHUNK) chunk = PROCESS_CHUNK;
-
-        err = audio_processor_apply(audio_buf + offset, chunk);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Processing failed at offset %lu", (unsigned long)offset);
-            free(audio_buf);
-            audio_processor_free();
-            coeff_loader_free(&bank);
-            sd_card_deinit();
-            return;
-        }
-        offset += chunk;
-
-        uint32_t pct = (offset * 100U) / num_samples;
-        if (pct >= next_progress_report) {
-            int64_t elapsed_ms = (esp_timer_get_time() - process_start_us) / 1000;
-            ESP_LOGI(TAG, "Processing progress: %lu%% (%lu/%lu), elapsed %lld ms",
-                     (unsigned long)pct,
-                     (unsigned long)offset,
-                     (unsigned long)num_samples,
-                     (long long)elapsed_ms);
-            next_progress_report += 10;
-        }
-
-        vTaskDelay(1);
+    err = audio_processor_apply(audio_buf, num_samples);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Audio processing failed: %s", esp_err_to_name(err));
+        free(audio_buf);
+        audio_processor_free();
+        coeff_loader_free(&bank);
+        sd_card_deinit();
+        return;
     }
-
     int64_t total_ms = (esp_timer_get_time() - process_start_us) / 1000;
     ESP_LOGI(TAG, "Audio processing complete in %lld ms", (long long)total_ms);
 

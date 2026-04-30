@@ -13,6 +13,16 @@ USFMH/sdkconfig
 # SPIFFS binary image
 *.bin
 
+# Auto-generated FIR coefficient exports (regenerate with demo.py --export-filter-matrix)
+filter_matrix.txt
+pythondemo/matrix.txt
+
+# Stale ESP-IDF sdkconfig backups
+*.old
+
+# Runtime debug output (move keepers to archive/debug_dumps/)
+dumps/
+
 # Python
 __pycache__/
 *.pyc

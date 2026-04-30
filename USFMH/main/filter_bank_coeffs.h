@@ -1,5 +1,14 @@
 #pragma once
 
+/*
+ * LEGACY — not compiled into the current firmware.
+ *
+ * Coefficients are now loaded at runtime from /sdcard/filters.bin via
+ * coeff_loader.c. This header is kept as a reference snapshot of the
+ * previously-baked-in coefficients and can be regenerated from the
+ * MATLAB matrix with: python pythondemo/gens/generate_filter_header.py
+ */
+
 #define FILTER_BANK_NUM_BANDS 32
 #define FILTER_BANK_NUM_TAPS 501
 

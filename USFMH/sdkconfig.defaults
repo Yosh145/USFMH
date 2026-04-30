@@ -18,3 +18,8 @@ CONFIG_FATFS_SECTOR_512=y
 
 # Console over USB Serial/JTAG — stdin/stdout over /dev/ttyACM0
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# esp-dsp FFT size: audio_processor uses a 16384-point FFT for its overlap-save
+# filterbank. See audio_processor.c for the algorithm.
+CONFIG_DSP_MAX_FFT_SIZE_16384=y
+CONFIG_DSP_MAX_FFT_SIZE=16384

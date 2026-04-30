@@ -14,7 +14,7 @@ typedef struct {
 } wav_header_info_t;
 
 /**
- * Parse WAV header from a file on SPIFFS.
+ * Parse WAV header from a file on the SD card.
  * Returns ESP_OK on success.
  */
 esp_err_t wav_parse_header(const char *filepath, wav_header_info_t *info);
@@ -28,7 +28,7 @@ esp_err_t wav_read_f32(const char *filepath, float **out_buf, uint32_t *out_num_
                        uint32_t *out_sample_rate);
 
 /**
- * Write float samples (normalized -1.0 to 1.0) to a 16-bit mono WAV file on SPIFFS.
+ * Write float samples (normalized -1.0 to 1.0) to a 16-bit mono WAV file on the SD card.
  */
 esp_err_t wav_write_f32(const char *filepath, const float *buf, uint32_t num_samples,
                         uint32_t sample_rate);

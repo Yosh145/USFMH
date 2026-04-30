@@ -28,8 +28,30 @@ import sounddevice as sd
 
 TONE_AMPLITUDE = 0.3       # Volume for test tones (0.0 - 1.0)
 PLAYBACK_SAMPLE_RATE = 44100  # Sample rate for tone generation
+TONE_FADE_DURATION_S = 0.020  # fade-in / fade-out applied to test tones to avoid clicks
 FIR_SAMPLE_RATE = 48000
-FIR_FILTER_ORDER = 500
+FIR_FILTER_ORDER = 500     # legacy — kept for filters.bin / MATLAB compatibility
+
+# Firmware FFT-filterbank parameters (must match audio_processor.c)
+FFT_N = 16384
+FFT_XOVER_BINS = 2.0       # raised-cosine transition width in bins at each band edge
+
+# Serial / boot timings for the USB Serial-JTAG link on ESP32-S3
+SERIAL_DEFAULT_BAUD = 115200
+RESET_DTR_HOLD_S = 0.1
+RESET_RTS_HOLD_S = 0.5
+BOOT_BANNER_TIMEOUT_S = 15.0
+PROTOCOL_LOOP_TIMEOUT_S = 120.0
+
+# Filesystem paths (relative to repo root). The "spiffs_data" directory name is
+# kept for historical reasons — the firmware now reads input.wav from the SD
+# card, but the host script still stages the prepared WAV here as a working copy.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_INPUT_WAV_PATH = REPO_ROOT / "spiffs_data" / "input.wav"
+DUMP_DIR = REPO_ROOT / "dumps"
+
+# Visual reference frequencies overlaid on the spectrum plots.
+PLOT_REFERENCE_FREQS = (392.0, 1975.33, 4698.67, 5301.33)
 
 # Band definitions matching filter_bank_coeffs.h (32-band FIR bank used by firmware)
 FILTER_BANK_MIN_FREQS = np.array([
@@ -78,10 +100,63 @@ def build_filter_layout() -> tuple[np.ndarray, np.ndarray]:
     return edges, centers
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FFT-filterbank helpers — mirror of firmware audio_processor.c
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fft_band_weight(freq_hz: np.ndarray | float, fmin: float, fmax: float,
+                    delta_hz: float) -> np.ndarray | float:
+    """Raised-cosine band window matching band_weight() in audio_processor.c.
+
+    Returns 1.0 inside [fmin+Δ/2, fmax-Δ/2], 0.0 outside [fmin-Δ/2, fmax+Δ/2],
+    and half-cosine transition at each edge. Adjacent bands with matched edges
+    sum to 1.0 (partition of unity)."""
+    f = np.asarray(freq_hz, dtype=np.float64)
+    half = delta_hz * 0.5
+    rising = 0.5 * (1.0 - np.cos(np.pi * (f - (fmin - half)) / delta_hz))
+    falling = 0.5 * (1.0 + np.cos(np.pi * (f - (fmax - half)) / delta_hz))
+    out = np.zeros_like(f)
+    # Pass band (flat 1.0)
+    flat = (f >= fmin + half) & (f <= fmax - half)
+    # Rising edge at fmin
+    rise = (f > fmin - half) & (f < fmin + half)
+    # Falling edge at fmax
+    fall = (f > fmax - half) & (f < fmax + half)
+    out[flat] = 1.0
+    out[rise] = rising[rise]
+    out[fall] = falling[fall]
+    return out
+
+
+def fft_composite_mask(gains: np.ndarray,
+                       mins: np.ndarray = FILTER_BANK_MIN_FREQS,
+                       maxs: np.ndarray = FILTER_BANK_MAX_FREQS,
+                       sample_rate: int = FIR_SAMPLE_RATE,
+                       fft_n: int = FFT_N) -> np.ndarray:
+    """Build the real-valued composite magnitude mask H_mag[k] for k = 0..N/2,
+    mirroring build_mask() in audio_processor.c for the positive half.
+
+    gains: linear gain per band (0 = muted). One per band in FILTER_BANK_*."""
+    bin_hz = sample_rate / fft_n
+    delta_hz = FFT_XOVER_BINS * bin_hz
+    k = np.arange(fft_n // 2 + 1)
+    freqs = k * bin_hz
+    H = np.zeros_like(freqs)
+    for j in range(len(mins)):
+        if gains[j] == 0.0:
+            continue
+        H += gains[j] * fft_band_weight(freqs, float(mins[j]), float(maxs[j]), delta_hz)
+    return H
+
+
 def design_bandpass_fir(low_hz: float, high_hz: float, center_hz: float,
                         sample_rate: int = FIR_SAMPLE_RATE,
                         order: int = FIR_FILTER_ORDER) -> np.ndarray:
-    """Design the same windowed-sinc FIR bandpass filter used in firmware."""
+    """Legacy windowed-sinc FIR bandpass designer.
+
+    No longer used by the firmware runtime (which uses an FFT filterbank), but
+    still used by export_filter_matrix() to write filters.bin / MATLAB-style
+    coefficient files."""
     tap_count = order + 1
     midpoint = order / 2.0
     n = np.arange(tap_count, dtype=np.float64)
@@ -220,8 +295,7 @@ def generate_tone(freq_hz: float, duration_ms: int, sample_rate: int = PLAYBACK_
     t = np.linspace(0, duration_s, int(sample_rate * duration_s), endpoint=False)
     tone = TONE_AMPLITUDE * np.sin(2 * np.pi * freq_hz * t).astype(np.float32)
 
-    # Apply 20ms fade-in and fade-out
-    fade_samples = int(0.02 * sample_rate)
+    fade_samples = int(TONE_FADE_DURATION_S * sample_rate)
     if fade_samples > 0 and len(tone) > 2 * fade_samples:
         fade_in = np.linspace(0, 1, fade_samples, dtype=np.float32)
         fade_out = np.linspace(1, 0, fade_samples, dtype=np.float32)
@@ -340,10 +414,9 @@ def plot_results(filtered_audio: np.ndarray, sample_rate: int, original_wav_path
     """
     try:
         import matplotlib.pyplot as plt
-        from scipy import signal as sp_signal
     except ImportError:
-        print("ERROR: matplotlib and scipy are required for --plot.")
-        print("  pip install matplotlib scipy")
+        print("ERROR: matplotlib is required for --plot.")
+        print("  pip install matplotlib")
         return
 
     # ── Load original audio at the same sample rate ───────────────────────
@@ -372,33 +445,36 @@ def plot_results(filtered_audio: np.ndarray, sample_rate: int, original_wav_path
     fig.canvas.manager.set_window_title("USFMH Filter Analysis")
 
     # ── Subplot 1: Filter Arrangement ─────────────────────────────────────
+    # FFT-filterbank: show each band's raised-cosine weight (all at unity gain)
+    # and the composite mask. This matches the firmware's audio_processor.c.
     ax1 = axes[0]
-    freqz_pts = 8192
+    bin_hz = sample_rate / FFT_N
+    delta_hz = FFT_XOVER_BINS * bin_hz
+    freqs_dense = np.logspace(np.log10(20), np.log10(sample_rate / 2), 4096)
     for i in range(len(FILTER_BANK_MIN_FREQS)):
-        coeffs = design_bandpass_fir(
-            FILTER_BANK_MIN_FREQS[i], FILTER_BANK_MAX_FREQS[i],
-            FILTER_BANK_CENTER_FREQS[i], sample_rate, FIR_FILTER_ORDER,
-        )
-        w, h = sp_signal.freqz(coeffs, worN=freqz_pts, fs=sample_rate)
-        mag_db = 20.0 * np.log10(np.abs(h) + 1e-12)
-        ax1.semilogx(w, mag_db, linewidth=0.8)
+        w = fft_band_weight(freqs_dense, float(FILTER_BANK_MIN_FREQS[i]),
+                            float(FILTER_BANK_MAX_FREQS[i]), delta_hz)
+        mag_db = 20.0 * np.log10(w + 1e-12)
+        ax1.semilogx(freqs_dense, mag_db, linewidth=0.8, alpha=0.6)
 
-    ax1.axhline(-20, color="black", linestyle="--", linewidth=1.2, label="-20 dB (noticeability threshold)")
+    unity = np.ones(len(FILTER_BANK_MIN_FREQS))
+    Hmag = fft_composite_mask(unity, sample_rate=sample_rate)
+    kfreqs = np.arange(len(Hmag)) * bin_hz
+    ax1.semilogx(kfreqs, 20.0 * np.log10(Hmag + 1e-12),
+                 color="black", linewidth=1.5, label="Composite mask (all bands unity)")
+    ax1.axhline(-20, color="red", linestyle="--", linewidth=1.0, label="-20 dB")
     ax1.set_xlim([30, 10000])
     ax1.set_ylim([-140, 20])
     ax1.set_xlabel("Frequency in Hz")
     ax1.set_ylabel("Magnitude in dB")
-    ax1.set_title("Filter Arrangement")
+    ax1.set_title(f"FFT Filterbank Arrangement (N={FFT_N}, {bin_hz:.2f} Hz/bin)")
     ax1.legend(loc="lower right", fontsize=8)
     ax1.grid(True, which="both", alpha=0.3)
-
-    # Reference frequencies from MATLAB script (visual markers)
-    ref_freqs = [392, 1975.33, 4698.67, 5301.33]
 
     # ── Subplot 2: Filtered Spectrum ───────────────────────────────────────
     ax2 = axes[1]
     ax2.semilogx(freq_filt[pos_filt], filt_fft[pos_filt], linewidth=1.5)
-    for rf in ref_freqs:
+    for rf in PLOT_REFERENCE_FREQS:
         ax2.axvline(rf, color="red", linestyle="--", linewidth=0.8, alpha=0.6)
     ax2.set_xlim([30, 20000])
     ax2.set_xlabel("Frequency in Hz")
@@ -409,7 +485,7 @@ def plot_results(filtered_audio: np.ndarray, sample_rate: int, original_wav_path
     # ── Subplot 3: Original Spectrum ───────────────────────────────────────
     ax3 = axes[2]
     ax3.semilogx(freq_orig[pos_orig], orig_fft[pos_orig], linewidth=1.5)
-    for rf in ref_freqs:
+    for rf in PLOT_REFERENCE_FREQS:
         ax3.axvline(rf, color="red", linestyle="--", linewidth=0.8, alpha=0.6)
     ax3.set_xlim([30, 20000])
     ax3.set_xlabel("Frequency in Hz")
@@ -434,15 +510,8 @@ def dump_diagnostics(filtered_audio: np.ndarray, sample_rate: int,
     Includes: original/filtered time-domain samples, their FFT magnitudes,
     filter bank frequency responses, and per-band statistics.
     """
-    try:
-        from scipy import signal as sp_signal
-    except ImportError:
-        print("ERROR: scipy is required for --dump.  pip install scipy")
-        return
-
-    dump_dir = Path(__file__).resolve().parents[1] / "dumps"
-    dump_dir.mkdir(exist_ok=True)
-    dump_path = dump_dir / f"dump_sample_{sample_label}.txt"
+    DUMP_DIR.mkdir(exist_ok=True)
+    dump_path = DUMP_DIR / f"dump_sample_{sample_label}.txt"
 
     # ── Load original audio ──────────────────────────────────────────────
     if original_wav_path.exists():
@@ -470,7 +539,7 @@ def dump_diagnostics(filtered_audio: np.ndarray, sample_rate: int,
         f.write(f"Sample rate: {sample_rate} Hz\n")
         f.write(f"Original samples: {L_orig}\n")
         f.write(f"Filtered samples: {L_filt}\n")
-        f.write(f"FIR taps: {FIR_FILTER_ORDER + 1}\n")
+        f.write(f"Firmware DSP: FFT filterbank, N={FFT_N}, bin={sample_rate/FFT_N:.2f} Hz\n")
         f.write(f"Number of bands: {len(FILTER_BANK_MIN_FREQS)}\n\n")
 
         # ── Original audio stats ─────────────────────────────────────────
@@ -516,29 +585,33 @@ def dump_diagnostics(filtered_audio: np.ndarray, sample_rate: int,
         f.write("\n")
 
         # ── Per-band analysis ────────────────────────────────────────────
+        # Peak dB / Gain@ctr are the response of the FFT composite mask
+        # (assuming all bands active at unity gain) — the actual firmware
+        # filter shape. Orig/Filt energy come from the signal FFTs.
         f.write("=" * 70 + "\n")
-        f.write("PER-BAND FILTER ANALYSIS\n")
+        f.write("PER-BAND FILTER ANALYSIS (FFT composite mask, all-bands-unity)\n")
         f.write(f"{'Band':>4}  {'fmin':>10}  {'fmax':>10}  {'fcenter':>10}  "
                 f"{'Peak dB':>8}  {'Gain@ctr':>9}  "
                 f"{'Orig energy':>12}  {'Filt energy':>12}  {'Ratio':>8}\n")
         f.write("-" * 100 + "\n")
 
-        freqz_pts = 8192
+        bin_hz = sample_rate / FFT_N
+        Hmag = fft_composite_mask(np.ones(len(FILTER_BANK_MIN_FREQS)),
+                                  sample_rate=sample_rate)
+        mask_freqs = np.arange(len(Hmag)) * bin_hz
+
         for i in range(len(FILTER_BANK_MIN_FREQS)):
             lo = FILTER_BANK_MIN_FREQS[i]
             hi = FILTER_BANK_MAX_FREQS[i]
             ctr = FILTER_BANK_CENTER_FREQS[i]
 
-            coeffs = design_bandpass_fir(lo, hi, ctr, sample_rate, FIR_FILTER_ORDER)
-            w, h = sp_signal.freqz(coeffs, worN=freqz_pts, fs=sample_rate)
-            mag = np.abs(h)
-            peak_db = 20.0 * np.log10(np.max(mag) + 1e-12)
+            band_bin = (mask_freqs >= lo) & (mask_freqs <= hi)
+            peak_val = np.max(Hmag[band_bin]) if np.any(band_bin) else 0.0
+            peak_db = 20.0 * np.log10(peak_val + 1e-12)
 
-            # Gain at center frequency
-            ctr_idx = np.argmin(np.abs(w - ctr))
-            gain_at_ctr = 20.0 * np.log10(mag[ctr_idx] + 1e-12)
+            ctr_idx = np.argmin(np.abs(mask_freqs - ctr))
+            gain_at_ctr = 20.0 * np.log10(Hmag[ctr_idx] + 1e-12)
 
-            # Energy in this band from original and filtered FFTs
             band_mask_o = (freq_orig[:half_orig] >= lo) & (freq_orig[:half_orig] <= hi)
             band_mask_f = (freq_filt[:half_filt] >= lo) & (freq_filt[:half_filt] <= hi)
             orig_energy = np.sum(orig_fft[:half_orig][band_mask_o] ** 2)
@@ -582,94 +655,12 @@ def dump_diagnostics(filtered_audio: np.ndarray, sample_rate: int,
     print(f"  File size: {dump_path.stat().st_size / 1024:.1f} KB")
 
 
-def load_matrix_filters(matrix_path: Path) -> list[dict]:
-    """Parse a MATLAB-generated matrix.txt and return filter metadata + coefficients."""
-    import re
-    pattern = re.compile(
-        r"Filter\s+(\d+):\s+fmin\s+=\s+([0-9.]+)\s+Hz,\s+fmax\s+=\s+([0-9.]+)\s+Hz,\s+fcenter\s+=\s+([0-9.]+)\s+Hz",
-    )
-    text = matrix_path.read_text(encoding="ascii", errors="replace")
-    lines = text.splitlines()
-
-    filters = []
-    current = None
-    for line in lines:
-        m = pattern.match(line.strip())
-        if m:
-            if current is not None:
-                current["coeffs"] = np.array(current["coeffs"], dtype=np.float64)
-                filters.append(current)
-            current = {
-                "index": int(m.group(1)),
-                "fmin": float(m.group(2)),
-                "fmax": float(m.group(3)),
-                "fcenter": float(m.group(4)),
-                "coeffs": [],
-            }
-            continue
-        if current is not None:
-            stripped = line.strip()
-            if stripped:
-                try:
-                    current["coeffs"].append(float(stripped))
-                except ValueError:
-                    pass
-    if current is not None:
-        current["coeffs"] = np.array(current["coeffs"], dtype=np.float64)
-        filters.append(current)
-
-    print(f"Loaded {len(filters)} filters from {matrix_path.name}, "
-          f"{len(filters[0]['coeffs'])} taps each")
-    return filters
-
-
-def simulate_processing(wav_path: Path, matrix_path: Path,
-                        sample_label: str, active_bands: list[int] | None = None,
-                        ) -> tuple[np.ndarray, np.ndarray, int]:
-    """
-    Simulate the ESP32 FIR filter bank entirely on the host using scipy.
-
-    Returns (filtered_audio, original_audio, sample_rate).
-    """
-    from scipy.signal import lfilter
-
-    # Load and resample audio to 48 kHz
-    orig_audio, orig_sr = read_wav_as_mono_float(wav_path)
-    audio = resample_audio(orig_audio, orig_sr, FIR_SAMPLE_RATE)
-    print(f"  Audio: {len(audio)} samples @ {FIR_SAMPLE_RATE} Hz "
-          f"({len(audio)/FIR_SAMPLE_RATE:.2f}s)")
-
-    # Load filter coefficients from MATLAB matrix
-    filters = load_matrix_filters(matrix_path)
-    num_bands = len(filters)
-
-    # Determine which bands are active
-    if active_bands is None:
-        active_bands = list(range(num_bands))
-    active_bands = [b for b in active_bands if b < num_bands]
-
-    print(f"  Applying {len(active_bands)}/{num_bands} bands "
-          f"({len(filters[0]['coeffs'])} taps each)...")
-
-    # Sum active bandpass filter outputs (same as ESP32 firmware logic)
-    filtered = np.zeros_like(audio)
-    for i, band_idx in enumerate(active_bands):
-        filt = filters[band_idx]
-        band_output = lfilter(filt["coeffs"], 1.0, audio)
-        filtered += band_output
-        if (i + 1) % 5 == 0 or i == len(active_bands) - 1:
-            print(f"    Band {band_idx} ({filt['fmin']:.0f}-{filt['fmax']:.0f} Hz) done "
-                  f"[{i+1}/{len(active_bands)}]")
-
-    print("  Simulation complete.")
-    return filtered.astype(np.float32), audio.astype(np.float32), FIR_SAMPLE_RATE
-
-
 def upload_wav_to_spiffs(port: str, baud: int, wav_path: str):
     """
-    Upload a WAV file to the ESP32's SPIFFS partition.
-    Uses esptool/parttool. This is a simplified helper — for production,
-    use idf.py spiffsgen or the partition tool.
+    Print instructions for uploading a WAV file to the ESP32's SPIFFS partition.
+
+    Note: the production firmware reads input.wav from the SD card, not from
+    SPIFFS. This helper is kept as a fallback for boards without SD wiring.
     """
     print(f"\nTo upload '{wav_path}' to SPIFFS, run:")
     print(f"  1. Create SPIFFS image:")
@@ -681,17 +672,18 @@ def upload_wav_to_spiffs(port: str, baud: int, wav_path: str):
     print()
 
 
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Construct the CLI argument parser for the demo host script."""
     parser = argparse.ArgumentParser(description="USFMH Demo Host Script")
-    default_spiffs_input = Path(__file__).resolve().parents[1] / "spiffs_data" / "input.wav"
     parser.add_argument("--port", help="Serial port (e.g., /dev/ttyUSB0, COM3)")
-    parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default: 115200)")
+    parser.add_argument("--baud", type=int, default=SERIAL_DEFAULT_BAUD,
+                        help=f"Baud rate (default: {SERIAL_DEFAULT_BAUD})")
     parser.add_argument("--upload", metavar="WAV_FILE",
                         help="Show instructions to upload a WAV file to SPIFFS before the test")
     parser.add_argument("--prepare-wav", metavar="WAV_FILE",
                         help="Convert a WAV file to 16-bit mono 48 kHz for SPIFFS")
-    parser.add_argument("--prepared-output", type=Path, default=default_spiffs_input,
-                        help=f"Output path for --prepare-wav (default: {default_spiffs_input})")
+    parser.add_argument("--prepared-output", type=Path, default=DEFAULT_INPUT_WAV_PATH,
+                        help=f"Output path for --prepare-wav (default: {DEFAULT_INPUT_WAV_PATH})")
     parser.add_argument("--export-filter-matrix", type=Path, metavar="TXT_FILE",
                         help="Write the FIR coefficient bank to a text file")
     parser.add_argument("--filter-sample-rate", type=int, default=FIR_SAMPLE_RATE,
@@ -705,96 +697,83 @@ def main():
                         help="After processing, show filter arrangement and spectrum plots")
     parser.add_argument("--dump", action="store_true",
                         help="Dump diagnostic data (FFTs, per-band stats, samples) to dumps/ directory")
-    args = parser.parse_args()
+    return parser
 
-    sample_index = None
-    sample_all = False
-    if args.sample is not None:
-        if args.sample.lower() == "all":
-            sample_all = True
-        else:
-            try:
-                sample_index = int(args.sample)
-            except ValueError:
-                parser.error(
-                    f"--sample must be 'all' or in range 0-{len(TEST_SAMPLE_FREQS) - 1}"
-                )
-            if not (0 <= sample_index < len(TEST_SAMPLE_FREQS)):
-                parser.error(f"--sample must be in range 0-{len(TEST_SAMPLE_FREQS) - 1}")
 
-    if args.prepare_wav:
-        prepare_wav_for_spiffs(Path(args.prepare_wav), args.prepared_output, args.filter_sample_rate)
+def parse_sample_arg(parser: argparse.ArgumentParser, raw: str | None) -> tuple[int | None, bool]:
+    """Validate the `--sample` flag. Returns (sample_index, sample_all)."""
+    if raw is None:
+        return None, False
+    if raw.lower() == "all":
+        return None, True
+    try:
+        idx = int(raw)
+    except ValueError:
+        parser.error(f"--sample must be 'all' or in range 0-{len(TEST_SAMPLE_FREQS) - 1}")
+    if not (0 <= idx < len(TEST_SAMPLE_FREQS)):
+        parser.error(f"--sample must be in range 0-{len(TEST_SAMPLE_FREQS) - 1}")
+    return idx, False
 
-    if args.export_filter_matrix:
-        export_filter_matrix(args.export_filter_matrix, args.filter_sample_rate, FIR_FILTER_ORDER)
-        print(f"Wrote filter matrix to {args.export_filter_matrix}")
 
-    if args.upload:
-        upload_wav_to_spiffs(args.port, args.baud, args.upload)
-        input("Press Enter after uploading the WAV file to continue...")
-
-    if not args.port:
-        if args.prepare_wav or args.export_filter_matrix:
-            return
-        parser.error("--port is required unless you are only using offline helpers")
-
-    print(f"Connecting to ESP32 on {args.port} at {args.baud} baud...")
-    ser = serial.Serial(args.port, args.baud, timeout=1)
-
-    # Open port first, then reset the board so the USB Serial/JTAG host
-    # connection is active before the firmware starts printing.
-    print("Resetting ESP32...")
-    ser.dtr = False
-    ser.rts = True
-    time.sleep(0.1)
-    ser.rts = False
-    time.sleep(0.5)
-
-    # Drain any boot ROM / bootloader output
-    if ser.in_waiting:
-        ser.read(ser.in_waiting)
-
-    # Wait for the firmware banner
-    print("Waiting for ESP32 boot (press RST if nothing happens)...")
+def _wait_for_boot_banner(ser: serial.Serial, timeout_s: float) -> str:
+    """Drain serial until the firmware prints its 'Waiting for host' banner.
+    Returns the accumulated boot log (whether or not the banner was seen)."""
     boot_log = ""
-    deadline = time.time() + 15
+    deadline = time.time() + timeout_s
     while time.time() < deadline:
         if ser.in_waiting:
             try:
                 chunk = ser.read(ser.in_waiting).decode("utf-8", errors="replace")
                 boot_log += chunk
                 if "Waiting for host" in boot_log:
-                    break
+                    return boot_log
             except Exception:
                 pass
         time.sleep(0.1)
-    else:
-        # DTR/RTS reset may not work on USB Serial/JTAG — ask for manual reset
+    return boot_log
+
+
+def connect_and_boot(port: str, baud: int) -> serial.Serial | None:
+    """Open the serial port, pulse DTR/RTS to reset the board, and wait for
+    the firmware boot banner. Returns the open Serial on success, or None
+    after closing it on failure (so the caller can simply check for None)."""
+    print(f"Connecting to ESP32 on {port} at {baud} baud...")
+    ser = serial.Serial(port, baud, timeout=1)
+
+    print("Resetting ESP32...")
+    ser.dtr = False
+    ser.rts = True
+    time.sleep(RESET_DTR_HOLD_S)
+    ser.rts = False
+    time.sleep(RESET_RTS_HOLD_S)
+
+    # Drain any boot ROM / bootloader output before waiting for the banner
+    if ser.in_waiting:
+        ser.read(ser.in_waiting)
+
+    print("Waiting for ESP32 boot (press RST if nothing happens)...")
+    boot_log = _wait_for_boot_banner(ser, BOOT_BANNER_TIMEOUT_S)
+
+    if "Waiting for host" not in boot_log:
+        # DTR/RTS reset isn't reliable on USB Serial/JTAG — fall back to manual RST
         print("DTR/RTS reset didn't trigger boot. Press RST on the board now...")
-        boot_log = ""
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            if ser.in_waiting:
-                try:
-                    chunk = ser.read(ser.in_waiting).decode("utf-8", errors="replace")
-                    boot_log += chunk
-                    if "Waiting for host" in boot_log:
-                        break
-                except Exception:
-                    pass
-            time.sleep(0.1)
-        else:
-            print("ERROR: Timed out waiting for ESP32 boot banner.")
-            print("       Make sure firmware is flashed and the USB cable is connected.")
-            if boot_log.strip():
-                print(f"       Received: {boot_log[:200]}")
-            ser.close()
-            return
+        boot_log = _wait_for_boot_banner(ser, BOOT_BANNER_TIMEOUT_S)
+
+    if "Waiting for host" not in boot_log:
+        print("ERROR: Timed out waiting for ESP32 boot banner.")
+        print("       Make sure firmware is flashed and the USB cable is connected.")
+        if boot_log.strip():
+            print(f"       Received: {boot_log[:200]}")
+        ser.close()
+        return None
 
     time.sleep(0.2)
+    return ser
 
-    # Send handshake
-    if args.sample is None:
+
+def send_handshake(ser: serial.Serial, sample_index: int | None, sample_all: bool):
+    """Send the appropriate READY handshake based on debug-sample selection."""
+    if sample_index is None and not sample_all:
         print("Sending READY handshake...")
         ser.write(b"READY\n")
     elif sample_all:
@@ -809,15 +788,19 @@ def main():
         ser.write(f"READY SAMPLE {sample_index}\n".encode("utf-8"))
     ser.flush()
 
-    # Main protocol loop
+
+def run_protocol_loop(ser: serial.Serial, args: argparse.Namespace,
+                      sample_index: int | None, sample_all: bool):
+    """Drive the host side of the TONE / AUDIO / DONE protocol once the
+    READY handshake has been sent. Plays tones, collects user responses,
+    receives the processed audio stream, and triggers --plot/--dump on
+    completion."""
     while True:
-        line = read_line(ser, timeout=120)
+        line = read_line(ser, timeout=PROTOCOL_LOOP_TIMEOUT_S)
         if not line:
             continue
 
         if line.startswith("TONE "):
-            # First TONE message — enter hearing test handler
-            # Re-inject this line by processing it here
             parts = line.split()
             if len(parts) >= 3:
                 freq = float(parts[1])
@@ -849,7 +832,7 @@ def main():
                 ser.write(f"{response}\n".encode("utf-8"))
                 ser.flush()
 
-                # Continue handling more TONE messages
+                # Continue handling the remaining TONE messages
                 remaining = handle_hearing_test(ser)
                 if remaining:
                     line = remaining
@@ -880,17 +863,64 @@ def main():
                     sample_label = "hearing"
 
                 if args.dump:
-                    dump_diagnostics(audio, sample_rate, default_spiffs_input, sample_label)
+                    dump_diagnostics(audio, sample_rate, DEFAULT_INPUT_WAV_PATH, sample_label)
                 if args.plot:
-                    plot_results(audio, sample_rate, default_spiffs_input)
-                break
+                    plot_results(audio, sample_rate, DEFAULT_INPUT_WAV_PATH)
+                return
 
         elif line == "DONE":
             print("\n===== COMPLETE =====")
-            break
+            return
 
-    ser.close()
-    print("Connection closed.")
+
+def run_offline_helpers(args: argparse.Namespace) -> bool:
+    """Run any of the non-serial helper modes the user selected on the CLI.
+    Returns True if at least one offline helper ran (used by main() to decide
+    whether --port is still required)."""
+    ran_any = False
+    if args.prepare_wav:
+        prepare_wav_for_spiffs(Path(args.prepare_wav), args.prepared_output, args.filter_sample_rate)
+        ran_any = True
+
+    if args.export_filter_matrix:
+        export_filter_matrix(args.export_filter_matrix, args.filter_sample_rate, FIR_FILTER_ORDER)
+        print(f"Wrote filter matrix to {args.export_filter_matrix}")
+        ran_any = True
+
+    if args.upload:
+        upload_wav_to_spiffs(args.port, args.baud, args.upload)
+        input("Press Enter after uploading the WAV file to continue...")
+        ran_any = True
+
+    return ran_any
+
+
+def main():
+    """CLI entry point. Parses args, runs any offline helpers, then (if a port
+    is supplied) connects to the ESP32 and drives the host side of the
+    hearing-test + audio-streaming protocol."""
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    sample_index, sample_all = parse_sample_arg(parser, args.sample)
+
+    ran_offline = run_offline_helpers(args)
+
+    if not args.port:
+        if ran_offline:
+            return
+        parser.error("--port is required unless you are only using offline helpers")
+
+    ser = connect_and_boot(args.port, args.baud)
+    if ser is None:
+        return
+
+    try:
+        send_handshake(ser, sample_index, sample_all)
+        run_protocol_loop(ser, args, sample_index, sample_all)
+    finally:
+        ser.close()
+        print("Connection closed.")
 
 
 if __name__ == "__main__":
